@@ -1,0 +1,31 @@
+PHRASES = [
+    "you won't believe",
+    "you wont believe",
+    "must see",
+    "gone wrong",
+    "top 10",
+    "top 5",
+    "will shock you",
+    "what happens next",
+]
+
+WORDS = [
+    "shocking",
+    "unbelievable",
+    "insane",
+    "exposed",
+    "secret",
+    "destroyed",
+    "epic",
+    "hack",
+    "worst",
+    "best",
+    "literally",
+    "viral",
+    "clickbait",
+    "mind-blowing",
+    "jaw-dropping",
+    "devastating",
+    "ultimate",
+    "revealed",
+]
