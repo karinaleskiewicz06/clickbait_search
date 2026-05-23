@@ -207,7 +207,17 @@ def analyze_content(title, video_id):
         print(f"  No weak segments (>= {WEAK_THRESHOLD}) either.")
 
     print("=" * 60)
-
+    
+    return {
+        "chunks": chunks,
+        "scores": [float(s) for s in scores], 
+        "best_index": best_i,
+        "best_chunk": best_chunk,
+        "peak_alignment_pct": int(best_pct),
+        "avg_match_pct": int(round(float(np.mean(scores)) * 100)),
+        "topic_density_pct": int(strong_density),
+        "signal_chaos_pct": int(std_pct)
+    }
 
 def main():
     url = sys.argv[1] if len(sys.argv) > 1 else input("YouTube URL: ")
