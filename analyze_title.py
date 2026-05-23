@@ -85,6 +85,16 @@ def analyze_title(title):
     print("Style score:", score, label)
     print("=" * 50)
 
+    return {
+        "caps_pct": caps_pct,
+        "exclamation_marks": excl,
+        "question_marks": quest,
+        "vader_score": vader,
+        "buzzwords": buzz,
+        "score": score,
+        "label": label
+    }
+
 
 def main():
     url = sys.argv[1] if len(sys.argv) > 1 else input("YouTube URL: ")
