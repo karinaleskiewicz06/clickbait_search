@@ -75,9 +75,11 @@ with st.spinner("Analyzing video..."):
     signal_chaos_pct = content_results["signal_chaos_pct"]
 
     times_min = [round(c["start"] / 60, 2) for c in chunks]
-    best_time_sec = int(best_chunk["start"])
-    timestamp_formatted = f"{best_time_sec // 60:02d}:{best_time_sec % 60:02d}"
-
+    first_strong_i = ac.first_index_above(scores, ac.STRONG_THRESHOLD)
+    total_time = chunks[-1]["start"] + ac.CHUNK_SECONDS
+    first_strong_pct = (chunks[first_strong_i]["start"] / total_time * 100) if first_strong_i is not None else 100.0
+    timestamp_formatted = ac.format_time(best_chunk["start"])
+    
 st.write("---")
 st.markdown(f"### Title: **{title}**")
 st.write("---")
@@ -130,39 +132,56 @@ with col_chart:
             is_title_clickbait = title_score >= 0.50
             has_strong_content = scores[best_i] >= ac.STRONG_THRESHOLD
             has_weak_content = scores[best_i] >= ac.WEAK_THRESHOLD
+            is_good_density = topic_density_pct >= 20.0
+            is_content_delayed = first_strong_pct > 65.0
+            is_good_structure = is_good_density and not is_content_delayed
 
-            if is_title_clickbait and not has_strong_content:
-                st.markdown("### ❌ NO.")
-                st.markdown(
-                    "This video is pure clickbait. The headline was manufactured just to get your view, "
-                    "but the actual content completely fails to deliver on its promise."
-                )
-            elif is_title_clickbait and has_strong_content:
-                st.markdown("### ⚠️ YES, BUT...")
-                st.markdown(
-                    "The headline is heavily exaggerated and sensationalized to generate hype. "
-                    "However, the video does eventually discuss the promised topic in detail."
-                )
-            elif not is_title_clickbait and not has_strong_content:
-                if has_weak_content:
+            if is_title_clickbait:
+                if not has_weak_content:
+                    st.markdown("### ❌ NO.")
+                    st.markdown(
+                        "This video is pure clickbait. The headline was manufactured just to get your view, "
+                        "but the actual content completely fails to deliver on its promise."
+                    )
+                elif not has_strong_content:
                     st.markdown("### 🧐 PROBABLY NOT.")
                     st.markdown(
-                        "While the title style isn't loud, the content is quite misleading. "
-                        "The creator only briefly touches upon the topic before completely drifting away."
+                        "The headline is heavily exaggerated. The creator only briefly and loosely touches "
+                        "upon the topic, without offering any strong or real substance."
+                    )
+                elif not is_good_structure:
+                    st.markdown("### ⚠️ YES, BUT...")
+                    st.markdown(
+                        f"The video covers the topic, but it is badly structured. "
+                        f"The main point is buried too deep ({int(first_strong_pct)}%) "
+                        f"or the focus density is too low ({topic_density_pct}%)."
                     )
                 else:
+                    st.markdown("### ⚠️ YES, BUT...")
+                    st.markdown(
+                        "The headline is heavily exaggerated and sensationalized to generate hype. "
+                        "However, the video does actually discuss the promised topic in comprehensive detail."
+                    )
+            
+            else:
+                if not has_weak_content:
                     st.markdown("### ❌ NO.")
                     st.markdown(
                         "The title layout seems normal, but it's a completely wrong headline. "
                         "The video covers an entirely different topic."
                     )
-            else:
-                st.markdown("### ✅ DEFINITELY YES!")
-                st.markdown(
-                    "This is a perfectly genuine video. The title is honest, accurate, "
-                    "and backed up by solid, relevant content."
-                )
-
+                elif not has_strong_content or not is_good_structure:
+                    st.markdown("### 🧐 PROBABLY NOT.")
+                    st.markdown(
+                        f"The title is honest, but the video is poorly focused "
+                        f"and has very low topic density ({topic_density_pct}%)."
+                    )
+                else:
+                    st.markdown("### ✅ DEFINITELY WORTH IT!")
+                    st.markdown(
+                        "This is a perfectly genuine video. The title is honest, accurate, "
+                        "and backed up by solid, relevant content."
+                    )
     if st.button("Analyze another video", use_container_width=True, type="primary"):
         st.session_state.current_url = ""
         st.rerun()
@@ -171,7 +190,7 @@ with col_time:
     with st.container(border=True):
         st.markdown("**Highest Relevance Point**")
         if scores[best_i] >= ac.WEAK_THRESHOLD:
-            st.header(f"{timestamp_formatted} (minutes)")
+            st.header(f"⏱️ {timestamp_formatted}")
             st.caption("The most important point of the video starts here. Context:")
             st.info(f"\"{best_chunk['text']}\"")
         else:
