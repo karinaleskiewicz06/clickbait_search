@@ -55,7 +55,7 @@ with st.spinner("Analyzing video..."):
     title_results = at.analyze_title(title)
     title_score = title_results["score"]
 
-    content_results = ac.analyze_content(title, video_id)
+    content_results = ac.analyze_content(title, video_id, verbose=False)
 
     if content_results is None:
         st.error("Could not analyze this video. It might not have English subtitles/transcription available.")
@@ -69,15 +69,13 @@ with st.spinner("Analyzing video..."):
     best_i = content_results["best_index"]
     best_chunk = content_results["best_chunk"]
 
-    peak_alignment_pct = content_results["peak_alignment_pct"]
+    peak_match_pct = content_results["peak_match_pct"]
     avg_match_pct = content_results["avg_match_pct"]
     topic_density_pct = content_results["topic_density_pct"]
     signal_chaos_pct = content_results["signal_chaos_pct"]
+    first_strong_pct = content_results["first_strong_pct"]
 
     times_min = [round(c["start"] / 60, 2) for c in chunks]
-    first_strong_i = ac.first_index_above(scores, ac.STRONG_THRESHOLD)
-    total_time = chunks[-1]["start"] + ac.CHUNK_SECONDS
-    first_strong_pct = (chunks[first_strong_i]["start"] / total_time * 100) if first_strong_i is not None else 100.0
     timestamp_formatted = ac.format_time(best_chunk["start"])
     
 st.write("---")
@@ -87,7 +85,7 @@ st.write("---")
 st.markdown("#### Analysis Metrics")
 col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
 col_m1.metric("Headline Clickbait Score", f"{int(title_score * 100)}%")
-col_m2.metric("Peak Content Match", f"{peak_alignment_pct}%")
+col_m2.metric("Peak Content Match", f"{peak_match_pct}%")
 col_m3.metric("Average Match", f"{avg_match_pct}%")
 col_m4.metric("Topic Focus", f"{topic_density_pct}%")
 col_m5.metric("Signal Chaos", f"{signal_chaos_pct}%")

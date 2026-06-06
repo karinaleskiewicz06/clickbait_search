@@ -1,25 +1,83 @@
 import re
 import sys
+from dataclasses import asdict, dataclass
+from functools import lru_cache
+from typing import Optional
 
 import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
+from clickbait_terms import PHRASES, WORDS
 from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
 from youtube_transcript_api import YouTubeTranscriptApi
 
 from yt_utils import get_video_id, get_title
 
 
-# Cosine similarity thresholds tuned for sentence-transformers/all-MiniLM-L6-v2.
+# Cosine similarity thresholds tuned for sentence-transformers/all-mpnet-base-v2
+# with 0.7 embedding + 0.3 lexical score blending.
 # Typical similarity between a YouTube title and a transcript chunk:
-#   < 0.20  unrelated
-#   0.20 - 0.30  loosely related (same general field)
-#   0.30 - 0.45  clearly related (talking around the topic)
-#   >= 0.45  talking directly about the topic
-WEAK_THRESHOLD = 0.25       # topic is at least loosely brought up
-STRONG_THRESHOLD = 0.40     # topic is clearly being discussed
+#   < 0.25  unrelated
+#   0.25 - 0.35  loosely related (same general field)
+#   0.35 - 0.50  clearly related (talking around the topic)
+#   >= 0.50  talking directly about the topic
+WEAK_THRESHOLD = 0.30
+STRONG_THRESHOLD = 0.45
 
-CHUNK_SECONDS = 45          # length of one transcript block
-TEXT_PREVIEW_LEN = 200      # how many chars of a chunk to show as a preview
+CHUNK_SECONDS = 45
+FINE_STRIDE_SECONDS = 15
+TEXT_PREVIEW_LEN = 200
+EMBED_WEIGHT = 0.7
+LEXICAL_WEIGHT = 0.3
+SMOOTH_WINDOW = 3
+
+MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
+
+NOISE_BRACKET = re.compile(
+    r"\[(?:Music|Singing|Applause|Laughter|Laughing|Crowd|Cheering|Silence)\]",
+    re.IGNORECASE,
+)
+NOISE_PAREN = re.compile(
+    r"\((?:applause|laughter|laughing|music|inaudible|crosstalk)\)",
+    re.IGNORECASE,
+)
+
+STOPWORDS = frozenset({
+    "the", "a", "an", "in", "on", "at", "to", "for", "of", "and", "or", "is",
+    "it", "this", "that", "how", "why", "what", "when", "with", "from", "by",
+    "vs", "are", "was", "be", "your", "you", "my", "we", "our",
+})
+
+
+@dataclass
+class ContentAnalysis:
+    chunks: list
+    scores: list
+    raw_scores: list
+    best_index: int
+    best_chunk: dict
+    peak_match_pct: int
+    avg_match_pct: int
+    topic_density_pct: int
+    signal_chaos_pct: int
+    first_weak_index: Optional[int]
+    first_strong_index: Optional[int]
+    first_strong_pct: float
+    total_time: float
+    weak_segments: list
+    strong_segments: list
+    title: str
+    video_id: str
+
+    def to_dict(self):
+        data = asdict(self)
+        # Backward compatibility for callers expecting the old metric name.
+        data["peak_alignment_pct"] = self.peak_match_pct
+        return data
+
+
+@lru_cache(maxsize=1)
+def get_embedding_model():
+    return SentenceTransformer(MODEL_NAME)
 
 
 def format_time(seconds):
@@ -35,36 +93,137 @@ def preview(text, limit=TEXT_PREVIEW_LEN):
     return text if len(text) <= limit else text[:limit].rstrip() + "..."
 
 
-def fetch_chunks(video_id, chunk_seconds=CHUNK_SECONDS, languages=("en",)):
-    """Pobiera transkrypcje i dzieli ja na bloki ~chunk_seconds sekund."""
+def clean_snippet_text(text):
+    text = NOISE_BRACKET.sub("", text)
+    text = NOISE_PAREN.sub("", text)
+    text = text.replace("♪", "")
+    return " ".join(text.split())
+
+
+def clean_title_for_embedding(title):
+    cleaned = title.lower()
+    for phrase in sorted(PHRASES, key=len, reverse=True):
+        cleaned = cleaned.replace(phrase, " ")
+    for word in WORDS:
+        cleaned = re.sub(r"\b" + re.escape(word) + r"\b", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -|:,.")
+    return cleaned if len(cleaned) >= 3 else title
+
+
+def extract_lexical_terms(title, cleaned_title):
+    terms = set()
+    for match in re.finditer(r'"([^"]+)"|\'([^\']+)\'', title):
+        terms.add(match.group(1) or match.group(2))
+    for match in re.finditer(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b", title):
+        terms.add(match.group(0))
+    for match in re.finditer(r"\b[A-Z]{2,}\b", title):
+        terms.add(match.group(0))
+    for match in re.finditer(r"\b\d[\w.]*\b", title):
+        terms.add(match.group(0))
+    for word in cleaned_title.split():
+        if len(word) > 3 and word not in STOPWORDS:
+            terms.add(word)
+    return [term for term in terms if len(term) >= 2]
+
+
+def lexical_score(text, terms):
+    if not terms:
+        return 0.0
+    lowered = text.lower()
+    hits = 0
+    for term in terms:
+        if " " in term:
+            if term.lower() in lowered:
+                hits += 1
+        elif re.search(r"\b" + re.escape(term.lower()) + r"\b", lowered):
+            hits += 1
+    return hits / len(terms)
+
+
+def fetch_transcript_snippets(video_id, languages=("en",)):
+    """Fetch transcript snippets with cleaned text, start, and duration."""
     transcript = YouTubeTranscriptApi().fetch(video_id, languages=list(languages))
-
-    chunks = []
-    text = ""
-    start = None
-
+    snippets = []
     for snippet in transcript.snippets:
-        # usuwa adnotacje typu [Music], (applause) i symbole nutek
-        clean_text = re.sub(r"\[.*?\]|\(.*?\)|♪", "", snippet.text)
-        clean_text = " ".join(clean_text.split())
-
+        clean_text = clean_snippet_text(snippet.text)
         if not clean_text:
             continue
+        snippets.append({
+            "text": clean_text,
+            "start": snippet.start,
+            "duration": snippet.duration,
+        })
+    if not snippets:
+        return [], 0.0
+    total_time = max(s["start"] + s["duration"] for s in snippets)
+    return snippets, total_time
 
-        if start is None:
-            start = snippet.start
-            text = clean_text + " "
-        elif snippet.start - start <= chunk_seconds:
-            text += clean_text + " "
-        else:
-            chunks.append({"text": text.strip(), "start": start})
-            start = snippet.start
-            text = clean_text + " "
 
-    if text.strip():
-        chunks.append({"text": text.strip(), "start": start})
+def build_time_window_chunks(snippets, window_sec, stride_sec):
+    """Build overlapping transcript chunks aligned to fixed time windows."""
+    if not snippets:
+        return []
+
+    end_time = max(s["start"] + s["duration"] for s in snippets)
+    start_time = snippets[0]["start"]
+    chunks = []
+    window_start = start_time
+
+    while window_start < end_time:
+        window_end = min(window_start + window_sec, end_time)
+        parts = []
+        for snippet in snippets:
+            snippet_end = snippet["start"] + snippet["duration"]
+            if snippet["start"] < window_end and snippet_end > window_start:
+                parts.append(snippet["text"])
+
+        if parts:
+            chunks.append({
+                "text": " ".join(parts),
+                "start": window_start,
+                "end": window_end,
+            })
+        window_start += stride_sec
 
     return chunks
+
+
+def pool_scores_to_primary(fine_chunks, fine_scores, primary_chunks):
+    """Max-pool fine-grained scores onto primary chunk intervals."""
+    pooled = []
+    for primary in primary_chunks:
+        primary_end = primary["end"]
+        best = 0.0
+        for fine, score in zip(fine_chunks, fine_scores):
+            if fine["start"] < primary_end and fine["end"] > primary["start"]:
+                best = max(best, score)
+        pooled.append(best)
+    return pooled
+
+
+def smooth_scores(scores, window=SMOOTH_WINDOW):
+    if len(scores) <= 1:
+        return list(scores)
+    arr = np.array(scores, dtype=float)
+    kernel = np.ones(window) / window
+    return np.convolve(arr, kernel, mode="same").tolist()
+
+
+def compute_chunk_scores(model, title, cleaned_title, lexical_terms, chunks):
+    texts = [chunk["text"] for chunk in chunks]
+    chunk_embeddings = model.encode(texts)
+    title_embeddings = model.encode([title, cleaned_title])
+    full_similarity = cosine_similarity(title_embeddings[:1], chunk_embeddings)[0]
+    clean_similarity = cosine_similarity(title_embeddings[1:], chunk_embeddings)[0]
+    embed_scores = np.maximum(full_similarity, clean_similarity)
+
+    combined = []
+    for embed_score, chunk in zip(embed_scores, chunks):
+        lex_score = lexical_score(chunk["text"], lexical_terms)
+        combined.append(
+            EMBED_WEIGHT * float(embed_score) + LEXICAL_WEIGHT * float(lex_score)
+        )
+    return combined
 
 
 def find_topic_segments(chunks, scores, threshold):
@@ -81,7 +240,7 @@ def find_topic_segments(chunks, scores, threshold):
             if j + 1 < n:
                 seg_end = chunks[j + 1]["start"]
             else:
-                seg_end = chunks[j]["start"] + CHUNK_SECONDS
+                seg_end = chunks[j].get("end", chunks[j]["start"] + CHUNK_SECONDS)
 
             peak_offset = int(np.argmax(scores[i:j + 1]))
             peak_idx = i + peak_offset
@@ -98,58 +257,97 @@ def find_topic_segments(chunks, scores, threshold):
 
 
 def first_index_above(scores, threshold):
-    for i, s in enumerate(scores):
-        if s >= threshold:
-            return i
+    for index, score in enumerate(scores):
+        if score >= threshold:
+            return index
     return None
 
 
-def analyze_content(title, video_id):
-    """Porownuje tytul z trescia transkrypcji przez embeddingi i cosine similarity."""
-    print("\nFetching transcript...")
+def compute_content_analysis(title, video_id, languages=("en",)):
+    """Compare title with transcript content via embeddings and lexical matching."""
     try:
-        chunks = fetch_chunks(video_id)
-    except Exception as e:
-        print("Could not fetch transcript for this video.")
-        print("Reason:", e)
-        print("(The video may not have captions, or they are in another language.)")
-        return
+        snippets, total_time = fetch_transcript_snippets(video_id, languages=languages)
+    except Exception:
+        return None
 
-    if not chunks:
-        print("Transcript is empty, skipping content analysis.")
-        return
+    if not snippets:
+        return None
 
-    print(f"Split into {len(chunks)} chunks.")
-    print("Loading sentence-transformer model (first run downloads ~90 MB)...")
-    model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    primary_chunks = build_time_window_chunks(
+        snippets, window_sec=CHUNK_SECONDS, stride_sec=CHUNK_SECONDS
+    )
+    fine_chunks = build_time_window_chunks(
+        snippets, window_sec=CHUNK_SECONDS, stride_sec=FINE_STRIDE_SECONDS
+    )
+    if not primary_chunks:
+        return None
 
-    print("Computing embeddings and similarities...")
-    texts = [c["text"] for c in chunks]
-    emb_chunks = model.encode(texts)
-    emb_title = model.encode([title])
-    scores = cosine_similarity(emb_title, emb_chunks)[0]
+    cleaned_title = clean_title_for_embedding(title)
+    lexical_terms = extract_lexical_terms(title, cleaned_title)
+    model = get_embedding_model()
 
-    total_time = chunks[-1]["start"] + CHUNK_SECONDS
+    fine_raw_scores = compute_chunk_scores(
+        model, title, cleaned_title, lexical_terms, fine_chunks
+    )
+    raw_scores = pool_scores_to_primary(fine_chunks, fine_raw_scores, primary_chunks)
+    scores = smooth_scores(raw_scores)
 
-    best_i = int(np.argmax(scores))
-    best_chunk = chunks[best_i]
-    best_pct = round(float(scores[best_i]) * 100, 1)
+    best_index = int(np.argmax(scores))
+    best_chunk = primary_chunks[best_index]
+    best_pct = round(float(scores[best_index]) * 100, 1)
 
-    first_weak_i = first_index_above(scores, WEAK_THRESHOLD)
-    first_strong_i = first_index_above(scores, STRONG_THRESHOLD)
+    first_weak_index = first_index_above(scores, WEAK_THRESHOLD)
+    first_strong_index = first_index_above(scores, STRONG_THRESHOLD)
 
-    weak_count = int(np.sum(scores >= WEAK_THRESHOLD))
-    strong_count = int(np.sum(scores >= STRONG_THRESHOLD))
-    weak_density = round(weak_count / len(chunks) * 100, 1)
-    strong_density = round(strong_count / len(chunks) * 100, 1)
+    weak_count = int(np.sum(np.array(scores) >= WEAK_THRESHOLD))
+    strong_count = int(np.sum(np.array(scores) >= STRONG_THRESHOLD))
+    weak_density = round(weak_count / len(primary_chunks) * 100, 1)
+    strong_density = round(strong_count / len(primary_chunks) * 100, 1)
     std_pct = round(float(np.std(scores)) * 100, 1)
+
+    if first_strong_index is not None:
+        first_strong_pct = round(
+            primary_chunks[first_strong_index]["start"] / total_time * 100, 1
+        )
+    else:
+        first_strong_pct = 100.0
+
+    return ContentAnalysis(
+        chunks=primary_chunks,
+        scores=[float(score) for score in scores],
+        raw_scores=[float(score) for score in raw_scores],
+        best_index=best_index,
+        best_chunk=best_chunk,
+        peak_match_pct=int(best_pct),
+        avg_match_pct=int(round(float(np.mean(scores)) * 100)),
+        topic_density_pct=int(strong_density),
+        signal_chaos_pct=int(std_pct),
+        first_weak_index=first_weak_index,
+        first_strong_index=first_strong_index,
+        first_strong_pct=first_strong_pct,
+        total_time=total_time,
+        weak_segments=find_topic_segments(primary_chunks, scores, WEAK_THRESHOLD),
+        strong_segments=find_topic_segments(primary_chunks, scores, STRONG_THRESHOLD),
+        title=title,
+        video_id=video_id,
+    )
+
+
+def print_content_report(result: ContentAnalysis):
+    chunks = result.chunks
+    scores = result.scores
+    best_chunk = result.best_chunk
+    best_pct = result.peak_match_pct
 
     print("\n" + "=" * 60)
     print("TRANSCRIPT ANALYSIS")
     print("=" * 60)
-    print("Title:", title)
-    print("Video length (approx):", format_time(total_time))
+    print("Title:", result.title)
+    print("Video length:", format_time(result.total_time))
+    print(f"Model: {MODEL_NAME}")
     print(f"Thresholds: weak >= {WEAK_THRESHOLD}, strong >= {STRONG_THRESHOLD}")
+    print(f"Chunks: {len(chunks)} primary ({CHUNK_SECONDS}s), "
+          f"scored with {FINE_STRIDE_SECONDS}s stride overlap")
 
     print("\nBEST MATCH")
     print(f"  Time:       {format_time(best_chunk['start'])}")
@@ -157,67 +355,80 @@ def analyze_content(title, video_id):
     print(f"  Excerpt:    {preview(best_chunk['text'])}")
 
     print("\nFIRST APPEARANCE OF THE TOPIC")
-    if first_weak_i is not None:
-        c = chunks[first_weak_i]
-        s_pct = round(float(scores[first_weak_i]) * 100, 1)
+    if result.first_weak_index is not None:
+        chunk = chunks[result.first_weak_index]
+        score_pct = round(float(scores[result.first_weak_index]) * 100, 1)
         print(f"  First loose mention (>= {WEAK_THRESHOLD}): "
-              f"{format_time(c['start'])}  ({s_pct} %)")
-        print(f"    > {preview(c['text'])}")
+              f"{format_time(chunk['start'])}  ({score_pct} %)")
+        print(f"    > {preview(chunk['text'])}")
     else:
         print(f"  First loose mention (>= {WEAK_THRESHOLD}): not found")
 
-    if first_strong_i is not None:
-        c = chunks[first_strong_i]
-        s_pct = round(float(scores[first_strong_i]) * 100, 1)
-        first_strong_time_pct = round(c["start"] / total_time * 100, 1)
+    if result.first_strong_index is not None:
+        chunk = chunks[result.first_strong_index]
+        score_pct = round(float(scores[result.first_strong_index]) * 100, 1)
         print(f"  First on-topic (>= {STRONG_THRESHOLD}):    "
-              f"{format_time(c['start'])}  ({s_pct} %)  "
-              f"[{first_strong_time_pct} % into the video]")
-        print(f"    > {preview(c['text'])}")
+              f"{format_time(chunk['start'])}  ({score_pct} %)  "
+              f"[{result.first_strong_pct} % into the video]")
+        print(f"    > {preview(chunk['text'])}")
     else:
         print(f"  First on-topic (>= {STRONG_THRESHOLD}):    not found "
               "(title topic never clearly appears -> possible clickbait)")
+
+    weak_count = int(np.sum(np.array(scores) >= WEAK_THRESHOLD))
+    strong_count = int(np.sum(np.array(scores) >= STRONG_THRESHOLD))
+    weak_density = round(weak_count / len(chunks) * 100, 1)
+    strong_density = round(strong_count / len(chunks) * 100, 1)
 
     print("\nTOPIC COVERAGE")
     print(f"  Strong (>= {STRONG_THRESHOLD}): {strong_count}/{len(chunks)} chunks "
           f"({strong_density} %)")
     print(f"  Weak   (>= {WEAK_THRESHOLD}): {weak_count}/{len(chunks)} chunks "
           f"({weak_density} %)")
-    print(f"  Score spread (std x 100): {std_pct}")
+    print(f"  Score spread (std x 100): {result.signal_chaos_pct}")
 
     print("\nON-TOPIC MOMENTS THROUGHOUT THE VIDEO")
-    strong_segments = find_topic_segments(chunks, scores, STRONG_THRESHOLD)
-    if strong_segments:
+    if result.strong_segments:
         print(f"  Strong segments (>= {STRONG_THRESHOLD}):")
-        for seg in strong_segments:
-            peak_pct = round(seg["peak_score"] * 100, 1)
-            print(f"    {format_time(seg['start'])} - {format_time(seg['end'])}"
+        for segment in result.strong_segments:
+            peak_pct = round(segment["peak_score"] * 100, 1)
+            print(f"    {format_time(segment['start'])} - {format_time(segment['end'])}"
                   f"   peak {peak_pct} %")
     else:
         print(f"  No strong segments (>= {STRONG_THRESHOLD}).")
 
-    weak_segments = find_topic_segments(chunks, scores, WEAK_THRESHOLD)
-    if weak_segments:
+    if result.weak_segments:
         print(f"  Weak segments (>= {WEAK_THRESHOLD}):")
-        for seg in weak_segments:
-            peak_pct = round(seg["peak_score"] * 100, 1)
-            print(f"    {format_time(seg['start'])} - {format_time(seg['end'])}"
+        for segment in result.weak_segments:
+            peak_pct = round(segment["peak_score"] * 100, 1)
+            print(f"    {format_time(segment['start'])} - {format_time(segment['end'])}"
                   f"   peak {peak_pct} %")
     else:
         print(f"  No weak segments (>= {WEAK_THRESHOLD}) either.")
 
     print("=" * 60)
-    
-    return {
-        "chunks": chunks,
-        "scores": [float(s) for s in scores], 
-        "best_index": best_i,
-        "best_chunk": best_chunk,
-        "peak_alignment_pct": int(best_pct),
-        "avg_match_pct": int(round(float(np.mean(scores)) * 100)),
-        "topic_density_pct": int(strong_density),
-        "signal_chaos_pct": int(std_pct)
-    }
+
+
+def analyze_content(title, video_id, verbose=True):
+    """Run content analysis and optionally print a CLI report."""
+    if verbose:
+        print("\nFetching transcript...")
+        print(f"Loading sentence-transformer model (first run downloads ~420 MB)...")
+
+    result = compute_content_analysis(title, video_id)
+    if result is None:
+        if verbose:
+            print("Could not fetch transcript for this video.")
+            print("(The video may not have captions, or they are in another language.)")
+        return None
+
+    if verbose:
+        print(f"Split into {len(result.chunks)} primary chunks.")
+        print("Computing embeddings and similarities...")
+        print_content_report(result)
+
+    return result.to_dict()
+
 
 def main():
     url = sys.argv[1] if len(sys.argv) > 1 else input("YouTube URL: ")
