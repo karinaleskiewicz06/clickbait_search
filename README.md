@@ -1,8 +1,4 @@
-# WorthIt / clickbait_search
 
-Narzędzie do analizy filmów YouTube: sprawdza, czy **tytuł** wygląda na clickbait i czy **transkrypcja** faktycznie dotyczy obiecanego tematu.
-
----
 
 ## Struktura projektu
 
@@ -17,7 +13,6 @@ Narzędzie do analizy filmów YouTube: sprawdza, czy **tytuł** wygląda na clic
 
 ---
 
-## Modele i biblioteki ML/NLP
 
 ### `analyze_content.py`
 
@@ -31,14 +26,7 @@ Narzędzie do analizy filmów YouTube: sprawdza, czy **tytuł** wygląda na clic
 
 Pierwsze uruchomienie pobiera model mpnet (~420 MB). Kolejne analizy w tej samej sesji używają cache.
 
-### `analyze_title.py` (kontekst dla GUI)
 
-| Komponent | Nazwa / pakiet | Do czego |
-|-----------|----------------|----------|
-| **Analiza sentymentu** | `vaderSentiment` (`SentimentIntensityAnalyzer`) | Wynik `compound` — emocjonalność / polaryzacja tytułu |
-| **Słownik clickbait** | `clickbait_terms.py` (`PHRASES`, `WORDS`) | Reguły, nie model — wykrywanie buzzwordów |
-
----
 
 ## Schemat działania `analyze_content.py`
 
@@ -211,19 +199,62 @@ model = get_embedding_model()  # SentenceTransformer(MODEL_NAME)
 
 ---
 
-## Werdykt w GUI (`gui.py`) — progi pomocnicze
+## Werdykt końcowy — `compute_watch_verdict()`
 
-Logika werdyktu zostaje na razie w `gui.py`. Używa metryk z `analyze_content` plus `title_score` z `analyze_title`.
+Logika odpowiedzi „Is it worth watching?” jest w `analyze_content.py`. GUI wywołuje:
 
-| Sygnał | Próg | Źródło |
-|--------|------|--------|
-| Clickbaitowy tytuł | `title_score >= 0.50` | `analyze_title.py` |
-| Luźny temat (peak) | `scores[best_i] >= 0.30` | `ac.WEAK_THRESHOLD` |
-| Mocny temat (peak) | `scores[best_i] >= 0.45` | `ac.STRONG_THRESHOLD` |
-| Dobra gęstość tematu | `topic_density_pct >= 20` | `gui.py` |
-| Temat nie za późno | `first_strong_pct <= 65` | `gui.py` |
+```python
+watch_verdict = compute_watch_verdict(title_score, content_results)
+```
 
-Drzewo decyzyjne: najpierw czy tytuł clickbait → czy peak ≥ weak → czy peak ≥ strong → czy struktura OK (gęstość + moment wejścia w temat).
+### Progi
+
+| Stała | Wartość | Znaczenie |
+|-------|---------|-----------|
+| `TITLE_CLICKBAIT_THRESHOLD` | `0.50` | Tytuł uznany za clickbait (`analyze_title`) |
+| `WEAK_THRESHOLD` | `0.30` | Luźne dopasowanie tematu |
+| `STRONG_THRESHOLD` | `0.45` | Mocne dopasowanie tematu |
+| `TOPIC_DENSITY_MIN` | `20` | Min. % chunków z mocnym tematem |
+| `STRONG_DENSITY_FALLBACK` | `15` | Zapasowy próg gęstości przy strong delivery |
+| `FIRST_STRONG_LATE_PCT` | `65` | Temat za późno, jeśli pierwszy strong moment > 65% filmu |
+| `AVG_MATCH_MIN` | `25` | Min. średnie dopasowanie całego filmu |
+
+### Sygnały (`compute_verdict_signals`)
+
+| Sygnał | Warunek |
+|--------|---------|
+| `delivers_weak` | peak ≥ weak **lub** istnieje `first_weak_index` |
+| `delivers_strong` | peak ≥ strong **lub** (`first_strong_index` istnieje **i** `topic_density_pct ≥ 15`) |
+| `good_structure` | gęstość ≥ 20 **i** temat nie za późno **i** `avg_match_pct ≥ 25` |
+
+### Drzewo decyzyjne
+
+```mermaid
+flowchart TD
+    A[Start] --> B{delivers_weak?}
+    B -->|Nie| C[❌ NO]
+    B -->|Tak| D{delivers_strong?}
+    D -->|Nie| E[🧐 PROBABLY NOT]
+    D -->|Tak| F{good_structure?}
+    F -->|Nie| G[⚠️ YES, BUT — zła struktura]
+    F -->|Tak| H{title_clickbait?}
+    H -->|Tak| I[⚠️ YES, BUT — clickbait]
+    H -->|Nie| J[✅ WORTH IT]
+```
+
+Kolejność ma znaczenie: najpierw czy w ogóle jest temat, potem czy jest mocno, potem struktura, na końcu clickbait tytułu.
+
+### Zwracany obiekt
+
+```python
+{
+    "verdict": "no" | "probably_not" | "yes_but" | "worth_it",
+    "headline": "### ...",
+    "message": "...",
+    "reason": "no_topic" | "weak_delivery" | "bad_structure" | "clickbait_title" | "genuine",
+    "signals": { ... },
+}
+```
 
 ---
 
@@ -242,6 +273,18 @@ python analyze_content.py "https://www.youtube.com/watch?v=..."
 streamlit run gui.py
 ```
 
+### Błąd `ModuleNotFoundError: No module named 'torchvision'`
+
+Streamlit przy starcie skanuje załadowane moduły. Pakiet `transformers` (używany przez `sentence-transformers`) ma lazy-importy modeli wizyjnych, które wymagają `torchvision`.
+
+```bash
+pip install torchvision
+# lub pełna instalacja z projektu:
+pip install -r requirements.txt
+```
+
+W repo jest też `.streamlit/config.toml` z `fileWatcherType = "none"`, żeby ograniczyć te ostrzeżenia. Import modelu embeddingów jest lazy (`get_embedding_model()`), więc `transformers` ładuje się dopiero przy pierwszej analizie filmu.
+
 ---
 
 ## Stałe konfiguracyjne (`analyze_content.py`)
@@ -256,3 +299,8 @@ streamlit run gui.py
 | `SMOOTH_WINDOW` | `3` |
 | `WEAK_THRESHOLD` | `0.30` |
 | `STRONG_THRESHOLD` | `0.45` |
+| `TITLE_CLICKBAIT_THRESHOLD` | `0.50` |
+| `TOPIC_DENSITY_MIN` | `20.0` |
+| `STRONG_DENSITY_FALLBACK` | `15.0` |
+| `FIRST_STRONG_LATE_PCT` | `65.0` |
+| `AVG_MATCH_MIN` | `25.0` |

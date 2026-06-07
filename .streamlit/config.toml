@@ -1,0 +1,4 @@
+[server]
+# Avoid Streamlit probing lazy-loaded transformers vision modules
+# (yolos, zoedepth, etc.) which require torchvision and spam tracebacks.
+fileWatcherType = "none"

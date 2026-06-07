@@ -4,3 +4,7 @@ youtube-transcript-api
 sentence-transformers
 scikit-learn
 numpy
+torch
+torchvision
+streamlit
+plotly

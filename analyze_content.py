@@ -6,7 +6,6 @@ from typing import Optional
 
 import numpy as np
 from clickbait_terms import PHRASES, WORDS
-from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from youtube_transcript_api import YouTubeTranscriptApi
 
@@ -22,6 +21,18 @@ from yt_utils import get_video_id, get_title
 #   >= 0.50  talking directly about the topic
 WEAK_THRESHOLD = 0.30
 STRONG_THRESHOLD = 0.45
+
+# Final "worth watching?" verdict thresholds (used with analyze_title score).
+TITLE_CLICKBAIT_THRESHOLD = 0.50
+TOPIC_DENSITY_MIN = 20.0
+FIRST_STRONG_LATE_PCT = 65.0
+AVG_MATCH_MIN = 25.0
+STRONG_DENSITY_FALLBACK = 15.0
+
+VERDICT_NO = "no"
+VERDICT_PROBABLY_NOT = "probably_not"
+VERDICT_YES_BUT = "yes_but"
+VERDICT_WORTH_IT = "worth_it"
 
 CHUNK_SECONDS = 45
 FINE_STRIDE_SECONDS = 15
@@ -77,6 +88,10 @@ class ContentAnalysis:
 
 @lru_cache(maxsize=1)
 def get_embedding_model():
+    # Lazy import: avoids loading transformers (and its optional vision deps)
+    # when Streamlit imports this module on startup.
+    from sentence_transformers import SentenceTransformer
+
     return SentenceTransformer(MODEL_NAME)
 
 
@@ -261,6 +276,123 @@ def first_index_above(scores, threshold):
         if score >= threshold:
             return index
     return None
+
+
+def compute_verdict_signals(title_score, content):
+    """Derive boolean signals used by the final watch recommendation."""
+    scores = content["scores"]
+    peak = scores[content["best_index"]]
+
+    title_clickbait = title_score >= TITLE_CLICKBAIT_THRESHOLD
+    delivers_weak = (
+        peak >= WEAK_THRESHOLD or content["first_weak_index"] is not None
+    )
+    delivers_strong = (
+        peak >= STRONG_THRESHOLD
+        or (
+            content["first_strong_index"] is not None
+            and content["topic_density_pct"] >= STRONG_DENSITY_FALLBACK
+        )
+    )
+    density_ok = content["topic_density_pct"] >= TOPIC_DENSITY_MIN
+    topic_late = (
+        content["first_strong_index"] is not None
+        and content["first_strong_pct"] > FIRST_STRONG_LATE_PCT
+    )
+    avg_ok = content["avg_match_pct"] >= AVG_MATCH_MIN
+    good_structure = density_ok and not topic_late and avg_ok
+
+    return {
+        "title_clickbait": title_clickbait,
+        "peak_score": float(peak),
+        "delivers_weak": delivers_weak,
+        "delivers_strong": delivers_strong,
+        "density_ok": density_ok,
+        "topic_late": topic_late,
+        "avg_ok": avg_ok,
+        "good_structure": good_structure,
+    }
+
+
+def compute_watch_verdict(title_score, content):
+    """
+    Return the final recommendation from title + content analysis.
+
+    Decision order:
+      1. No weak topic signal anywhere -> NO
+      2. Weak but no strong delivery -> PROBABLY NOT
+      3. Strong but bad structure -> YES, BUT
+      4. Strong + good structure + clickbait title -> YES, BUT
+      5. Strong + good structure + honest title -> WORTH IT
+    """
+    signals = compute_verdict_signals(title_score, content)
+
+    if not signals["delivers_weak"]:
+        verdict = VERDICT_NO
+        if signals["title_clickbait"]:
+            headline = "### ❌ NO."
+            message = (
+                "This video is pure clickbait. The headline was manufactured just to get your view, "
+                "but the actual content completely fails to deliver on its promise."
+            )
+        else:
+            headline = "### ❌ NO."
+            message = (
+                "The title layout seems normal, but it's a completely wrong headline. "
+                "The video covers an entirely different topic."
+            )
+        reason = "no_topic"
+    elif not signals["delivers_strong"]:
+        verdict = VERDICT_PROBABLY_NOT
+        headline = "### 🧐 PROBABLY NOT."
+        if signals["title_clickbait"]:
+            message = (
+                "The headline is heavily exaggerated. The creator only briefly and loosely touches "
+                "upon the topic, without offering any strong or real substance."
+            )
+        else:
+            message = (
+                f"The title is honest, but the video is poorly focused "
+                f"and has very low topic density ({content['topic_density_pct']}%)."
+            )
+        reason = "weak_delivery"
+    elif not signals["good_structure"]:
+        verdict = VERDICT_YES_BUT
+        headline = "### ⚠️ YES, BUT..."
+        parts = []
+        if not signals["density_ok"]:
+            parts.append(f"focus density is too low ({content['topic_density_pct']}%)")
+        if signals["topic_late"]:
+            parts.append(f"the main point is buried too deep ({int(content['first_strong_pct'])}%)")
+        if not signals["avg_ok"]:
+            parts.append(f"overall relevance stays low ({content['avg_match_pct']}%)")
+        detail = ", ".join(parts) if parts else "the topic is not sustained through the video"
+        message = f"The video touches the topic, but it is badly structured: {detail}."
+        reason = "bad_structure"
+    elif signals["title_clickbait"]:
+        verdict = VERDICT_YES_BUT
+        headline = "### ⚠️ YES, BUT..."
+        message = (
+            "The headline is heavily exaggerated and sensationalized to generate hype. "
+            "However, the video does actually discuss the promised topic in comprehensive detail."
+        )
+        reason = "clickbait_title"
+    else:
+        verdict = VERDICT_WORTH_IT
+        headline = "### ✅ DEFINITELY WORTH IT!"
+        message = (
+            "This is a perfectly genuine video. The title is honest, accurate, "
+            "and backed up by solid, relevant content."
+        )
+        reason = "genuine"
+
+    return {
+        "verdict": verdict,
+        "headline": headline,
+        "message": message,
+        "reason": reason,
+        "signals": signals,
+    }
 
 
 def compute_content_analysis(title, video_id, languages=("en",)):

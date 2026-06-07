@@ -73,8 +73,6 @@ with st.spinner("Analyzing video..."):
     avg_match_pct = content_results["avg_match_pct"]
     topic_density_pct = content_results["topic_density_pct"]
     signal_chaos_pct = content_results["signal_chaos_pct"]
-    first_strong_pct = content_results["first_strong_pct"]
-
     times_min = [round(c["start"] / 60, 2) for c in chunks]
     timestamp_formatted = ac.format_time(best_chunk["start"])
     
@@ -127,59 +125,9 @@ with col_chart:
         with st.container(border=True):
             st.markdown("### Is it worth watching?")
 
-            is_title_clickbait = title_score >= 0.50
-            has_strong_content = scores[best_i] >= ac.STRONG_THRESHOLD
-            has_weak_content = scores[best_i] >= ac.WEAK_THRESHOLD
-            is_good_density = topic_density_pct >= 20.0
-            is_content_delayed = first_strong_pct > 65.0
-            is_good_structure = is_good_density and not is_content_delayed
-
-            if is_title_clickbait:
-                if not has_weak_content:
-                    st.markdown("### ❌ NO.")
-                    st.markdown(
-                        "This video is pure clickbait. The headline was manufactured just to get your view, "
-                        "but the actual content completely fails to deliver on its promise."
-                    )
-                elif not has_strong_content:
-                    st.markdown("### 🧐 PROBABLY NOT.")
-                    st.markdown(
-                        "The headline is heavily exaggerated. The creator only briefly and loosely touches "
-                        "upon the topic, without offering any strong or real substance."
-                    )
-                elif not is_good_structure:
-                    st.markdown("### ⚠️ YES, BUT...")
-                    st.markdown(
-                        f"The video covers the topic, but it is badly structured. "
-                        f"The main point is buried too deep ({int(first_strong_pct)}%) "
-                        f"or the focus density is too low ({topic_density_pct}%)."
-                    )
-                else:
-                    st.markdown("### ⚠️ YES, BUT...")
-                    st.markdown(
-                        "The headline is heavily exaggerated and sensationalized to generate hype. "
-                        "However, the video does actually discuss the promised topic in comprehensive detail."
-                    )
-            
-            else:
-                if not has_weak_content:
-                    st.markdown("### ❌ NO.")
-                    st.markdown(
-                        "The title layout seems normal, but it's a completely wrong headline. "
-                        "The video covers an entirely different topic."
-                    )
-                elif not has_strong_content or not is_good_structure:
-                    st.markdown("### 🧐 PROBABLY NOT.")
-                    st.markdown(
-                        f"The title is honest, but the video is poorly focused "
-                        f"and has very low topic density ({topic_density_pct}%)."
-                    )
-                else:
-                    st.markdown("### ✅ DEFINITELY WORTH IT!")
-                    st.markdown(
-                        "This is a perfectly genuine video. The title is honest, accurate, "
-                        "and backed up by solid, relevant content."
-                    )
+            watch_verdict = ac.compute_watch_verdict(title_score, content_results)
+            st.markdown(watch_verdict["headline"])
+            st.markdown(watch_verdict["message"])
     if st.button("Analyze another video", use_container_width=True, type="primary"):
         st.session_state.current_url = ""
         st.rerun()
