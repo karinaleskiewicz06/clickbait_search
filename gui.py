@@ -1,5 +1,6 @@
 import streamlit as st
 import plotly.graph_objects as go
+import textwrap
 
 import yt_utils
 import analyze_title as at
@@ -33,12 +34,18 @@ with st.sidebar:
 st.title("🕵️ WorthIt")
 st.write("")
 
-url_input = st.text_input("Analyze YT video URL:",
-                          value=st.session_state.current_url,
-                          placeholder="Paste YouTube link and press Enter...",
-                          label_visibility="collapsed")
+col_input, col_search_btn = st.columns([5, 1], vertical_alignment="bottom")
 
-if url_input != st.session_state.current_url:
+with col_input:
+    url_input = st.text_input("Analyze YT video URL:",
+                              value=st.session_state.current_url,
+                              placeholder="Paste YouTube link here...",
+                              label_visibility="collapsed")
+
+with col_search_btn:
+    search_clicked = st.button("Analyze", use_container_width=True, type="secondary")
+
+if url_input != st.session_state.current_url or search_clicked:
     st.session_state.current_url = url_input
     st.rerun()
 
@@ -77,16 +84,24 @@ with st.spinner("Analyzing video..."):
     timestamp_formatted = ac.format_time(best_chunk["start"])
     
 st.write("---")
-st.markdown(f"### Title: **{title}**")
-st.write("---")
 
-st.markdown("#### Analysis Metrics")
+st.subheader(f"Title: {title}")
+
+st.write("")
 col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
 col_m1.metric("Headline Clickbait Score", f"{int(title_score * 100)}%")
-col_m2.metric("Peak Content Match", f"{peak_match_pct}%")
-col_m3.metric("Average Match", f"{avg_match_pct}%")
-col_m4.metric("Topic Focus", f"{topic_density_pct}%")
-col_m5.metric("Signal Chaos", f"{signal_chaos_pct}%")
+col_m2.metric("Peak Match", f"{peak_match_pct}%")
+col_m3.metric("Avg Match", f"{avg_match_pct}%")
+col_m4.metric("Focus", f"{topic_density_pct}%")
+col_m5.metric("Chaos", f"{signal_chaos_pct}%")
+
+st.write("---")
+
+with st.container(border=True):
+    st.markdown("**Is it worth watching?**")
+    watch_verdict = ac.compute_watch_verdict(title_score, content_results)
+    st.markdown(watch_verdict["headline"])
+    st.markdown(watch_verdict["message"])
 
 st.write("")
 
@@ -110,7 +125,7 @@ with col_chart:
         ))
 
         fig_timeline.update_layout(
-            height=250, margin=dict(l=10, r=10, t=10, b=10), paper_bgcolor='rgba(0,0,0,0)',
+            height=240, margin=dict(l=10, r=10, t=10, b=10), paper_bgcolor='rgba(0,0,0,0)',
             plot_bgcolor='rgba(0,0,0,0)', showlegend=False,
             xaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.05)', tickfont=dict(color='lightgray'),
                        title="Video Timeline (Minutes)"),
@@ -122,23 +137,18 @@ with col_chart:
         )
         st.plotly_chart(fig_timeline, use_container_width=True, config={'displayModeBar': False})
 
-        with st.container(border=True):
-            st.markdown("### Is it worth watching?")
-
-            watch_verdict = ac.compute_watch_verdict(title_score, content_results)
-            st.markdown(watch_verdict["headline"])
-            st.markdown(watch_verdict["message"])
     if st.button("Analyze another video", use_container_width=True, type="primary"):
         st.session_state.current_url = ""
         st.rerun()
 
 with col_time:
     with st.container(border=True):
-        st.markdown("**Highest Relevance Point**")
         if scores[best_i] >= ac.WEAK_THRESHOLD:
-            st.header(f"⏱️ {timestamp_formatted}")
-            st.caption("The most important point of the video starts here. Context:")
-            st.info(f"\"{best_chunk['text']}\"")
+            st.markdown(f"**Highest Relevance Point** &nbsp;&nbsp; ⏱️ **{timestamp_formatted}**")
+            st.write("")
+            short_text = textwrap.shorten(best_chunk["text"], width=450, placeholder="...")
+            st.info(f'"{short_text}"')
         else:
+            st.markdown("**Highest Relevance Point**")
             st.header("None")
             st.caption("No strictly relevant moment found.")
