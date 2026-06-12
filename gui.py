@@ -13,22 +13,24 @@ if "history" not in st.session_state:
 if "current_url" not in st.session_state:
     st.session_state.current_url = ""
 
+def reset_analysis():
+    st.session_state.current_url = ""
+
 with st.sidebar:
     st.title("WorthIt")
     st.caption("Clickbait detector.")
     st.divider()
 
     st.markdown("### Search History")
-    for title_hist, url_hist in list(st.session_state.history.items()):
-        if st.button(f"{title_hist[:25]}...", key=url_hist, use_container_width=True):
+    for url_hist, data_hist in st.session_state.history.items():
+        if st.button(f"{data_hist['title'][:25]}...", key=url_hist, use_container_width=True):
             st.session_state.current_url = url_hist
             st.rerun()
 
     if st.session_state.history:
         st.write("")
-        if st.button("Clear History", use_container_width=True):
+        if st.button("Clear History", use_container_width=True, on_click=reset_analysis):
             st.session_state.history = {}
-            st.session_state.current_url = ""
             st.rerun()
 
 st.title("🕵️ WorthIt")
@@ -54,22 +56,33 @@ if not st.session_state.current_url:
 
 url = st.session_state.current_url.strip()
 
-with st.spinner("Analyzing video..."):
-    video_id = yt_utils.get_video_id(url)
-    title = yt_utils.get_title(video_id)
-    st.session_state.history[title] = url
+if url:
+    if url in st.session_state.history:
+        data_hist = st.session_state.history[url]
+        title = data_hist["title"]
+        title_score = data_hist["score"]
+        content_results = data_hist["results"]
+    else:
+        with st.spinner("Analyzing video..."):
+            video_id = yt_utils.get_video_id(url)
+            title = yt_utils.get_title(video_id)
 
-    title_results = at.analyze_title(title)
-    title_score = title_results["score"]
+            title_results = at.analyze_title(title)
+            title_score = title_results["score"]
 
-    content_results = ac.analyze_content(title, video_id, verbose=False)
+            content_results = ac.analyze_content(title, video_id, verbose=False)
 
-    if content_results is None:
-        st.error("Could not analyze this video. It might not have English subtitles/transcription available.")
-        if st.button("Try another video", use_container_width=True):
-            st.session_state.current_url = ""
-            st.rerun()
-        st.stop()
+            if content_results is None:
+                st.error("Could not analyze this video. It might not have English subtitles/transcription available.")
+                if st.button("Try another video", use_container_width=True, on_click=reset_analysis):
+                    st.rerun()
+                st.stop()
+
+            st.session_state.history[url] = {
+                "title": title,
+                "score": title_score,
+                "results": content_results
+            }
 
     chunks = content_results["chunks"]
     scores = content_results["scores"]
@@ -82,73 +95,72 @@ with st.spinner("Analyzing video..."):
     signal_chaos_pct = content_results["signal_chaos_pct"]
     times_min = [round(c["start"] / 60, 2) for c in chunks]
     timestamp_formatted = ac.format_time(best_chunk["start"])
-    
-st.write("---")
+        
+    st.write("---")
 
-st.subheader(f"Title: {title}")
+    st.subheader(f"Title: {title}")
 
-st.write("")
-col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
-col_m1.metric("Headline Clickbait Score", f"{int(title_score * 100)}%")
-col_m2.metric("Peak Match", f"{peak_match_pct}%")
-col_m3.metric("Avg Match", f"{avg_match_pct}%")
-col_m4.metric("Focus", f"{topic_density_pct}%")
-col_m5.metric("Chaos", f"{signal_chaos_pct}%")
+    st.write("")
+    col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
+    col_m1.metric("Headline Clickbait Score", f"{int(title_score * 100)}%")
+    col_m2.metric("Peak Match", f"{peak_match_pct}%")
+    col_m3.metric("Avg Match", f"{avg_match_pct}%")
+    col_m4.metric("Focus", f"{topic_density_pct}%")
+    col_m5.metric("Chaos", f"{signal_chaos_pct}%")
 
-st.write("---")
+    st.write("---")
 
-with st.container(border=True):
-    st.markdown("**Is it worth watching?**")
-    watch_verdict = ac.compute_watch_verdict(title_score, content_results)
-    st.markdown(watch_verdict["headline"])
-    st.markdown(watch_verdict["message"])
-
-st.write("")
-
-col_chart, col_time = st.columns([2, 1], gap="large")
-
-with col_chart:
     with st.container(border=True):
-        st.markdown("**Timeline Relevance (X: Minutes | Y: Match Strength)**")
-        fig_timeline = go.Figure()
+        st.markdown("**Is it worth watching?**")
+        watch_verdict = ac.compute_watch_verdict(title_score, content_results)
+        st.markdown(watch_verdict["headline"])
+        st.markdown(watch_verdict["message"])
 
-        fig_timeline.add_trace(go.Scatter(
-            x=times_min, y=scores, mode='lines',
-            line=dict(width=3, color='royalblue', shape='spline'),
-            name="Relevance", hovertemplate="Minute: %{x}<br>Match: %{y:.2f}<extra></extra>"
-        ))
+    st.write("")
 
-        fig_timeline.add_trace(go.Scatter(
-            x=[times_min[best_i]], y=[scores[best_i]], mode='markers',
-            marker=dict(color='white', size=10, line=dict(color='crimson', width=2)),
-            name="Peak Match", hoverinfo='skip'
-        ))
+    col_chart, col_time = st.columns([2, 1], gap="large")
 
-        fig_timeline.update_layout(
-            height=240, margin=dict(l=10, r=10, t=10, b=10), paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)', showlegend=False,
-            xaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.05)', tickfont=dict(color='lightgray'),
-                       title="Video Timeline (Minutes)"),
-            yaxis=dict(
-                showgrid=True, gridcolor='rgba(255,255,255,0.05)', range=[0, 1], tickfont=dict(color='lightgray'),
-                tickvals=[0.0, ac.WEAK_THRESHOLD, ac.STRONG_THRESHOLD, 1.0],
-                ticktext=["0.0", "Weak Match", "Strong Match", "1.0"]
+    with col_chart:
+        with st.container(border=True):
+            st.markdown("**Timeline Relevance (X: Minutes | Y: Match Strength)**")
+            fig_timeline = go.Figure()
+
+            fig_timeline.add_trace(go.Scatter(
+                x=times_min, y=scores, mode='lines',
+                line=dict(width=3, color='royalblue', shape='spline'),
+                name="Relevance", hovertemplate="Minute: %{x}<br>Match: %{y:.2f}<extra></extra>"
+            ))
+
+            fig_timeline.add_trace(go.Scatter(
+                x=[times_min[best_i]], y=[scores[best_i]], mode='markers',
+                marker=dict(color='white', size=10, line=dict(color='crimson', width=2)),
+                name="Peak Match", hoverinfo='skip'
+            ))
+
+            fig_timeline.update_layout(
+                height=240, margin=dict(l=10, r=10, t=10, b=10), paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)', showlegend=False,
+                xaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.05)', tickfont=dict(color='lightgray'),
+                           title="Video Timeline (Minutes)"),
+                yaxis=dict(
+                    showgrid=True, gridcolor='rgba(255,255,255,0.05)', range=[0, 1], tickfont=dict(color='lightgray'),
+                    tickvals=[0.0, ac.WEAK_THRESHOLD, ac.STRONG_THRESHOLD, 1.0],
+                    ticktext=["0.0", "Weak Match", "Strong Match", "1.0"]
+                )
             )
-        )
-        st.plotly_chart(fig_timeline, use_container_width=True, config={'displayModeBar': False})
+            st.plotly_chart(fig_timeline, use_container_width=True, config={'displayModeBar': False})
 
-    if st.button("Analyze another video", use_container_width=True, type="primary"):
-        st.session_state.current_url = ""
-        st.rerun()
+        if st.button("Analyze another video", use_container_width=True, type="primary", on_click=reset_analysis):
+            st.rerun()
 
-with col_time:
-    with st.container(border=True):
-        if scores[best_i] >= ac.WEAK_THRESHOLD:
-            st.markdown(f"**Highest Relevance Point** &nbsp;&nbsp; ⏱️ **{timestamp_formatted}**")
-            st.write("")
-            short_text = textwrap.shorten(best_chunk["text"], width=450, placeholder="...")
-            st.info(f'"{short_text}"')
-        else:
-            st.markdown("**Highest Relevance Point**")
-            st.header("None")
-            st.caption("No strictly relevant moment found.")
+    with col_time:
+        with st.container(border=True):
+            if scores[best_i] >= ac.WEAK_THRESHOLD:
+                st.markdown(f"**Highest Relevance Point** &nbsp;&nbsp; ⏱️ **{timestamp_formatted}**")
+                st.write("")
+                short_text = textwrap.shorten(best_chunk["text"], width=450, placeholder="...")
+                st.info(f'"{short_text}"')
+            else:
+                st.markdown("**Highest Relevance Point**")
+                st.header("None")
+                st.caption("No strictly relevant moment found.")
