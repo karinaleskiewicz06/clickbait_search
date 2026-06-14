@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+venv/
+.venv/
+.env
+
+# Unrelated nested project (has its own git repo)
+QC1_Quantum_Banknote_Classifier_on_ODRA_5/

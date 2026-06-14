@@ -23,11 +23,15 @@ WEAK_THRESHOLD = 0.30
 STRONG_THRESHOLD = 0.45
 
 # Final "worth watching?" verdict thresholds (used with analyze_title score).
-TITLE_CLICKBAIT_THRESHOLD = 0.50
-TOPIC_DENSITY_MIN = 20.0
+TITLE_CLICKBAIT_THRESHOLD = 0.45       # mild sensational titles (e.g. 48% score)
+FOCUS_NO_MAX = 15.0                    # focus below this is "critical" only with low avg
+AVG_NO_MAX = 30.0                      # with critical focus -> NO only if avg is also below this
+TOPIC_DENSITY_MIN = 30.0               # min focus % for "strong delivery" and good structure
+AVG_MATCH_MIN = 32.0                   # min average match for good structure
+AVG_YES_BUT_MIN = 32.0                 # low focus but decent avg -> YES, BUT
+WORTH_IT_DENSITY_MIN = 30.0            # min focus for the green verdict
+WORTH_IT_AVG_MIN = 38.0                # min average for the green verdict
 FIRST_STRONG_LATE_PCT = 65.0
-AVG_MATCH_MIN = 25.0
-STRONG_DENSITY_FALLBACK = 15.0
 
 VERDICT_NO = "no"
 VERDICT_PROBABLY_NOT = "probably_not"
@@ -282,25 +286,31 @@ def compute_verdict_signals(title_score, content):
     """Derive boolean signals used by the final watch recommendation."""
     scores = content["scores"]
     peak = scores[content["best_index"]]
+    focus_pct = content["topic_density_pct"]
+    avg_pct = content["avg_match_pct"]
 
     title_clickbait = title_score >= TITLE_CLICKBAIT_THRESHOLD
     delivers_weak = (
         peak >= WEAK_THRESHOLD or content["first_weak_index"] is not None
     )
+    # Peak alone is not enough — topic must stay present across the video (focus).
     delivers_strong = (
-        peak >= STRONG_THRESHOLD
-        or (
-            content["first_strong_index"] is not None
-            and content["topic_density_pct"] >= STRONG_DENSITY_FALLBACK
-        )
+        peak >= STRONG_THRESHOLD and focus_pct >= TOPIC_DENSITY_MIN
     )
-    density_ok = content["topic_density_pct"] >= TOPIC_DENSITY_MIN
+    density_ok = focus_pct >= TOPIC_DENSITY_MIN
     topic_late = (
         content["first_strong_index"] is not None
         and content["first_strong_pct"] > FIRST_STRONG_LATE_PCT
     )
-    avg_ok = content["avg_match_pct"] >= AVG_MATCH_MIN
+    avg_ok = avg_pct >= AVG_MATCH_MIN
     good_structure = density_ok and not topic_late and avg_ok
+    worth_it_ready = (
+        focus_pct >= WORTH_IT_DENSITY_MIN and avg_pct >= WORTH_IT_AVG_MIN
+    )
+    focus_critically_low = focus_pct < FOCUS_NO_MAX and avg_pct < AVG_NO_MAX
+    low_focus_decent_avg = (
+        focus_pct < TOPIC_DENSITY_MIN and avg_pct >= AVG_YES_BUT_MIN
+    )
 
     return {
         "title_clickbait": title_clickbait,
@@ -311,6 +321,9 @@ def compute_verdict_signals(title_score, content):
         "topic_late": topic_late,
         "avg_ok": avg_ok,
         "good_structure": good_structure,
+        "worth_it_ready": worth_it_ready,
+        "focus_critically_low": focus_critically_low,
+        "low_focus_decent_avg": low_focus_decent_avg,
     }
 
 
@@ -320,10 +333,13 @@ def compute_watch_verdict(title_score, content):
 
     Decision order:
       1. No weak topic signal anywhere -> NO
-      2. Weak but no strong delivery -> PROBABLY NOT
-      3. Strong but bad structure -> YES, BUT
-      4. Strong + good structure + clickbait title -> YES, BUT
-      5. Strong + good structure + honest title -> WORTH IT
+      2. Critical failure (focus < 15% AND avg < 30%) -> NO
+      3. Low focus but decent average -> YES, BUT
+      4. Weak delivery -> PROBABLY NOT
+      5. Strong but bad structure -> YES, BUT
+      6. Strong + good structure + clickbait title -> YES, BUT
+      7. Strong + good structure + thin metrics -> YES, BUT
+      8. Strong + good structure + honest title -> WORTH IT
     """
     signals = compute_verdict_signals(title_score, content)
 
@@ -342,13 +358,50 @@ def compute_watch_verdict(title_score, content):
                 "The video covers an entirely different topic."
             )
         reason = "no_topic"
+    elif signals["focus_critically_low"]:
+        verdict = VERDICT_NO
+        headline = "### ❌ NO."
+        if signals["title_clickbait"]:
+            message = (
+                "This video is pure clickbait. The title hooks you, but almost none of the runtime "
+                f"actually stays on that topic (focus {content['topic_density_pct']}%)."
+            )
+        else:
+            message = (
+                f"The title promises one thing, but the video barely delivers on it "
+                f"(focus {content['topic_density_pct']}%). Most of the content is filler or off-topic."
+            )
+        reason = "critically_low_focus"
+    elif signals["low_focus_decent_avg"]:
+        verdict = VERDICT_YES_BUT
+        headline = "### ⚠️ YES, BUT..."
+        if signals["title_clickbait"]:
+            message = (
+                "The title is sensationalized to pull clicks, but the story does come up "
+                f"throughout the video (average match {content['avg_match_pct']}%). "
+                f"Still, only {content['topic_density_pct']}% of the runtime stays tightly on-topic — "
+                "expect a lot of padding around the main story."
+            )
+        else:
+            message = (
+                f"The video keeps circling back to the title topic on average "
+                f"({content['avg_match_pct']}% match), but focus is low "
+                f"({content['topic_density_pct']}%). Worth it only if you accept the filler."
+            )
+        reason = "low_focus_decent_avg"
     elif not signals["delivers_strong"]:
         verdict = VERDICT_PROBABLY_NOT
         headline = "### 🧐 PROBABLY NOT."
         if signals["title_clickbait"]:
             message = (
-                "The headline is heavily exaggerated. The creator only briefly and loosely touches "
-                "upon the topic, without offering any strong or real substance."
+                "The headline is heavily exaggerated. The creator only briefly touches "
+                "upon the topic, without sustained focus or real substance "
+                f"(focus {content['topic_density_pct']}%)."
+            )
+        elif signals["peak_score"] >= STRONG_THRESHOLD:
+            message = (
+                f"The video has one strong moment about the title topic, but focus stays too low "
+                f"({content['topic_density_pct']}%). Most of the runtime is filler or off-topic."
             )
         else:
             message = (
@@ -377,6 +430,15 @@ def compute_watch_verdict(title_score, content):
             "However, the video does actually discuss the promised topic in comprehensive detail."
         )
         reason = "clickbait_title"
+    elif not signals["worth_it_ready"]:
+        verdict = VERDICT_YES_BUT
+        headline = "### ⚠️ YES, BUT..."
+        message = (
+            f"The title matches the content, but focus is only moderate "
+            f"({content['topic_density_pct']}% on-topic, average match {content['avg_match_pct']}%). "
+            f"Expect filler between the good parts."
+        )
+        reason = "thin_focus"
     else:
         verdict = VERDICT_WORTH_IT
         headline = "### ✅ DEFINITELY WORTH IT!"
